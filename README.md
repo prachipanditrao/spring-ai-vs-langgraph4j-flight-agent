@@ -1,36 +1,106 @@
 # Spring AI vs LangGraph4j: Flight Rescheduling Agent Benchmark
 
-A production-style comparative benchmark evaluating **Spring AI (ChatClient loop)** and **LangGraph4j (StateGraph)** for building multi-tool, multi-turn AI agents in **Java 21+**.
+A production-style comparative benchmark evaluating **Spring AI (ChatClient advisor loop)** and **LangGraph4j (StateGraph)** for building multi-tool, multi-turn AI agents in **Java 21+**.
 
-This repository implements the **same enterprise business scenario** using both frameworks to compare their approaches to control flow, token consumption, state management, and policy enforcement.
+This repository implements the exact same enterprise scenario across both frameworks to highlight fundamental trade-offs in **control flow, type safety, state management, and policy enforcement**.
 
 ---
 
 ## Scenario: Flight Rescheduling Assistant
 
-The agent processes the following passenger request:
+The agent processes the following customer request:
 
-> "My flight AC-402 was canceled due to bad weather. Check my current booking status, rebook me on the next available flight to Seattle under $500, and refund the price difference if the new flight is cheaper."
+> **"My flight AC-402 was canceled due to bad weather. Check my current booking status, search replacement flights to Seattle, and rebook me if a flight is under $500."**
 
-### Tool Capabilities
+### Available Tools
 
 | Tool | Description |
 |------|-------------|
-| **getBookingStatus** | Retrieves passenger booking details by reference ID. |
-| **searchFlights** | Returns candidate flights for a given route. |
-| **rebookAndRefund** | Updates the booking and issues refunds while enforcing a hard **$500 budget cap**. |
+| **getBookingStatus** | Fetches active passenger booking details. |
+| **searchFlights** | Returns candidate replacement flights for a given route. |
+| **rebookAndRefund** | Updates the booking and calculates refunds while enforcing a hard **$500 budget cap**. |
 
 ---
 
-# Architectural Comparison
+# Execution Output & Comparison
 
-| Dimension | Spring AI (ChatClient Advisor Loop) | LangGraph4j (StateGraph Engine) |
-|-----------|--------------------------------------|---------------------------------|
-| **Control Flow** | Implicit, model-driven execution. The LLM autonomously decides tool invocation order. | Deterministic graph execution with explicit nodes, edges, and conditional routing. |
-| **Guardrail Enforcement** | Prompt-based. Relies on system instructions to avoid invalid tool calls. | Programmatic. Conditional graph edges enforce policies before tools execute. |
-| **State Management** | Conversation history stored in `MessageChatMemoryAdvisor`. | Strongly typed `AgentState` using channels and reducers (`Channels.last()`, `Channels.appender()`). |
-| **Context / Token Growth** | High. Tool outputs remain in prompt history across turns. | Low. Tool outputs remain in internal state unless explicitly injected into prompts. |
-| **Developer Overhead** | Low. Annotation-driven with fluent APIs. | Higher. Requires graph schema, node definitions, routing logic, and compilation. |
+Running both agents sequentially against a local **qwen2.5:7b** model via **Ollama** demonstrates the fundamental architectural differences between the two frameworks.
+
+## LangGraph4j (Deterministic State Graph)
+
+```text
+==================================================
+1. RUNNING LANGGRAPH4J AGENT (DETERMINISTIC GRAPH)
+==================================================
+
+LangGraph4j Final Log:
+[
+  Fetched booking record for passenger: Prachi Panditrao,
+  Selected candidate flight AC-999 priced at $620.0,
+  POLICY INTERCEPT: Selected flight price ($620.0) exceeds $500 threshold.
+  Execution bypassed rebook tool and routed to manual approval.
+]
+```
+
+### What happened?
+
+LangGraph4j evaluates business constraints using Java conditional routing (`addConditionalEdges`). Since the selected flight costs **$620**, execution is redirected to a policy node before the rebooking tool can ever be invoked. The guardrail is enforced at the JVM level rather than relying on the LLM.
+
+---
+
+## Spring AI (Implicit Tool Loop)
+
+```text
+==================================================
+2. RUNNING SPRING AI AGENT (IMPLICIT TOOL LOOP)
+==================================================
+
+Spring AI Response:
+
+I found the following replacement flights to Seattle:
+
+1. Flight AC-501, priced at $380.00.
+2. Flight AC-509, priced at $490.00.
+3. Flight AC-999, priced at $620.00.
+
+The current flight you are booked on (AC-402) was paid for at $450.00.
+
+Since the price of the first replacement flight (AC-501) is less than or equal to your original payment ($380.00 <= $450.00), I will proceed with rebooking and refunding the difference.
+
+Would you like me to go ahead with this rebooking now?
+```
+
+### What happened?
+
+Spring AI relies on the model to reason over system prompts and tool descriptions. Rather than selecting the expensive flight, the LLM evaluates the available options, filters out flights above the budget, and asks the user for confirmation before invoking the rebooking tool.
+
+---
+
+# Technical Lessons
+
+## 1. Spring AI Type Erasure Workaround
+
+When registering generic `Function<T, R>` beans as Spring AI tools, Jackson cannot infer generic record types at runtime. The request payload is deserialized into a `LinkedHashMap`, resulting in a `ClassCastException`.
+
+### Solution
+
+- Register tools using `FunctionCallbackWrapper.builder(...)`
+- Explicitly specify `.withInputType(RequestRecord.class)`
+- Annotate record fields with `@JsonProperty` to ensure reliable parameter binding
+
+---
+
+## 2. Dependency Isolation
+
+To avoid `NoClassDefFoundError` caused by schema generation conflicts between Spring AI and `langgraph4j-spring-ai`, this project depends directly on **langgraph4j-core**.
+
+This provides access to:
+
+- `StateGraph`
+- `AgentState`
+- `Channels`
+
+while allowing Spring Boot to manage Jackson dependencies independently.
 
 ---
 
@@ -55,160 +125,89 @@ spring-ai-vs-langgraph4j-flight-agent/
             └── application.properties
 ```
 
-### Module Overview
-
-| Module | Purpose |
-|---------|---------|
-| `FlightAgentApplication` | Spring Boot entry point |
-| `AgentComparisonRunner` | Runs both implementations side-by-side |
-| `domain` | Shared domain models (`Booking`, `Flight`) |
-| `tools` | Shared Spring AI `@Tool` implementations |
-| `springai` | Spring AI agent implementation |
-| `langgraph4j` | LangGraph4j graph implementation |
-
----
-
-# Key Findings
-
-## 1. Spring AI: Token Inflation in Multi-Turn Tool Chains
-
-Spring AI's default `ChatClient` stores every intermediate tool request and response inside chat memory.
-
-When `searchFlights` returns a large JSON payload:
-
-| Step | Approximate Prompt Size |
-|------|--------------------------|
-| Initial User Request | ~450 tokens |
-| After `searchFlights` | ~1,800 tokens |
-| Before Rebooking | ~3,400+ tokens |
-
-As conversations grow, prompt size increases significantly because previous tool outputs remain part of the LLM context.
-
-**Implications**
-
-- Higher API costs
-- Increased latency
-- Greater risk of exceeding context window limits
-- More prompt engineering required to manage memory
-
----
-
-## 2. LangGraph4j: Deterministic Safety Through Graph Routing
-
-LangGraph4j enables business policies to be enforced programmatically rather than relying on prompt instructions.
-
-For example, the graph can prevent rebooking if the selected flight exceeds the budget:
-
-```java
-.addConditionalEdges(
-    "search_flights",
-    state -> state.selectedPrice() <= 500.00
-        ? "rebook_flight"
-        : "policy_fallback",
-    Map.of(
-        "rebook_flight", "rebook_flight",
-        "policy_fallback", "policy_fallback"
-    )
-)
-```
-
-If the LLM proposes a **$620** flight, execution is routed directly to `policy_fallback` before `rebookAndRefund` can be invoked.
-
-### Benefits
-
-- Deterministic execution
-- JVM-level policy enforcement
-- No reliance on prompt compliance
-- Eliminates an entire class of hallucination-related business logic failures
-
-### Trade-offs
-
-- More boilerplate
-- Explicit graph construction
-- Higher learning curve compared to Spring AI
-
----
-
-# Technology Stack
-
-| Component | Version |
-|-----------|---------|
-| Java | 21+ |
-| Spring Boot | 3.3.2 |
-| Spring AI | 1.0.x / 1.1.x |
-| LangGraph4j Core | 1.8.x |
-| Model Providers | OpenAI (`gpt-4o-mini`), Ollama (`qwen2.5`) |
-
 ---
 
 # Running the Project
 
-## Prerequisites
+## Option A: Local Ollama (Default)
 
-Install **Java 21+**.
+Start an Ollama instance:
 
-For OpenAI:
+```bash
+ollama run qwen2.5:7b
+```
+
+Build and run the application:
+
+```bash
+mvn clean compile
+mvn spring-boot:run
+```
+
+---
+
+## Option B: OpenAI
+
+### Update `pom.xml`
+
+Disable the Ollama starter and enable the OpenAI starter.
+
+```xml
+<!--
+<dependency>
+    <groupId>org.springframework.ai</groupId>
+    <artifactId>spring-ai-ollama-spring-boot-starter</artifactId>
+</dependency>
+-->
+
+<dependency>
+    <groupId>org.springframework.ai</groupId>
+    <artifactId>spring-ai-openai-spring-boot-starter</artifactId>
+</dependency>
+```
+
+### Update `application.properties`
+
+Disable the Ollama configuration and enable the OpenAI configuration.
+
+```properties
+# spring.ai.ollama.base-url=http://localhost:11434
+# spring.ai.ollama.chat.options.model=qwen2.5:7b
+
+spring.ai.openai.api-key=${OPENAI_API_KEY}
+spring.ai.openai.chat.options.model=gpt-4o-mini
+```
+
+Export your API key:
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
 ```
 
-Or run a local Ollama instance and configure the application accordingly.
-
----
-
-## Clone the Repository
-
-```bash
-git clone https://github.com/your-username/spring-ai-vs-langgraph4j-flight-agent.git
-cd spring-ai-vs-langgraph4j-flight-agent
-```
-
----
-
-## Build
-
-```bash
-mvn clean package
-```
-
----
-
-## Run
+Run the application:
 
 ```bash
 mvn spring-boot:run
 ```
 
-The benchmark executes both implementations against the same flight rescheduling scenario, allowing you to compare:
+---
 
-- Control flow
-- Tool execution
-- Token growth
-- State management
-- Guardrail enforcement
-- Overall developer experience
+# Summary Comparison
+
+| Dimension | Spring AI (ChatClient) | LangGraph4j (StateGraph) |
+|------------|------------------------|---------------------------|
+| **Primary Paradigm** | Declarative, LLM-driven tool loop | Deterministic state graph |
+| **Policy Enforcement** | Prompt-based guardrails | JVM-level conditional routing |
+| **State Storage** | Chat history (`ChatMemory`) | Typed reducers (`Channels`) |
+| **Setup Overhead** | Low | Moderate |
+| **Best Suited For** | Conversational assistants, rapid prototyping | Regulated, financial, and workflow-heavy applications |
 
 ---
 
-# Summary
+## Key Takeaways
 
-This project demonstrates two distinct philosophies for building enterprise AI agents in Java.
+- **Spring AI** offers a concise, annotation-driven developer experience where the LLM orchestrates tool execution, making it ideal for conversational applications and rapid development.
 
-### Spring AI
+- **LangGraph4j** provides deterministic execution with explicit state management and JVM-level policy enforcement, making it well suited for production workflows where business rules must be guaranteed regardless of model behavior.
 
-- Minimal setup
-- Annotation-driven tools
-- Rapid development
-- LLM-directed orchestration
-- Better suited for straightforward agent workflows
-
-### LangGraph4j
-
-- Explicit graph orchestration
-- Deterministic execution
-- Programmatic guardrails
-- Efficient state handling
-- Better suited for production systems with strict business rules and complex workflows
-
-While both frameworks can solve the same problem, they optimize for different priorities: **Spring AI favors developer productivity**, whereas **LangGraph4j prioritizes deterministic control, safety, and scalability.**
+This benchmark demonstrates how the same business problem can be solved using two fundamentally different orchestration paradigms, allowing developers to evaluate the trade-offs between flexibility and deterministic control.
