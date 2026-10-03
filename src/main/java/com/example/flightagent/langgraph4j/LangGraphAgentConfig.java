@@ -33,22 +33,33 @@ public class LangGraphAgentConfig {
             );
         };
 
-        // Node 2: Search flights & evaluate candidates via Function.apply(...)
+        // Node 2: Search flights & evaluate candidates with self-healing error capture
         NodeAction<FlightAgentState> searchFlightsNode = state -> {
-            var flights = tools.searchFlights().apply(new FlightSearchRequest("SEA"));
-            // Simulate agent picking the $620 option (AC-999) to test policy intercept
-            var selectedFlight = flights.stream()
-                    .filter(f -> f.flightId().equals("AC-999"))
-                    .findFirst()
-                    .orElse(flights.getFirst());
+            try {
+                var flights = tools.searchFlights().apply(new FlightSearchRequest("SEA"));
+                
+                // Pick AC-999 if present (to test policy violation), otherwise take best compliant candidate
+                var selectedFlight = flights.stream()
+                        .filter(f -> f.flightId().equals("AC-999"))
+                        .findFirst()
+                        .orElse(flights.getFirst());
 
-            return Map.of(
-                FlightAgentState.SELECTED_PRICE_KEY, selectedFlight.price(),
-                FlightAgentState.MESSAGES_KEY, List.of("Selected candidate flight " + selectedFlight.flightId() + " priced at $" + selectedFlight.price())
-            );
+                return Map.of(
+                    FlightAgentState.SELECTED_PRICE_KEY, selectedFlight.price(),
+                    FlightAgentState.LAST_ERROR_KEY, "",
+                    FlightAgentState.MESSAGES_KEY, List.of("Selected candidate flight " + selectedFlight.flightId() + " priced at $" + selectedFlight.price())
+                );
+            } catch (Exception ex) {
+                // Catch downstream failure, increment retryCount, and record error in state delta
+                return Map.of(
+                    FlightAgentState.LAST_ERROR_KEY, ex.getMessage(),
+                    FlightAgentState.RETRY_COUNT_KEY, state.retryCount() + 1,
+                    FlightAgentState.MESSAGES_KEY, List.of("Search attempt failed: " + ex.getMessage())
+                );
+            }
         };
 
-        // Node 3: Rebook flight (Only reached if price <= $500) via Function.apply(...)
+        // Node 3: Rebook flight (Only reached if price <= $500 and no unrecovered error)
         NodeAction<FlightAgentState> rebookNode = state -> {
             String result = tools.rebookAndRefund().apply(new RebookRequest(state.bookingId(), "AC-501", state.selectedPrice()));
             return Map.of(
@@ -56,13 +67,17 @@ public class LangGraphAgentConfig {
             );
         };
 
-        // Node 4: Policy Fallback Node (Executed if price > $500)
-        NodeAction<FlightAgentState> policyFallbackNode = state -> Map.of(
-            FlightAgentState.MESSAGES_KEY, List.of(
-                "POLICY INTERCEPT: Selected flight price ($" + state.selectedPrice() + 
-                ") exceeds $500 threshold. Execution bypassed rebook tool and routed to manual approval."
-            )
-        );
+        // Node 4: Fallback Node (Handles both Price Violations & Tripped Circuit Breakers)
+        NodeAction<FlightAgentState> policyFallbackNode = state -> {
+            boolean isCircuitTripped = !state.lastError().isBlank();
+            String reason = isCircuitTripped
+                ? "CIRCUIT_BREAKER_TRIPPED: Downstream dependency exhausted retries. Last error: " + state.lastError()
+                : "POLICY INTERCEPT: Selected flight price ($" + state.selectedPrice() + ") exceeds $500 threshold. Execution bypassed rebook tool and routed to manual approval.";
+
+            return Map.of(
+                FlightAgentState.MESSAGES_KEY, List.of(reason)
+            );
+        };
 
         return new StateGraph<>(FlightAgentState.SCHEMA, FlightAgentState::new)
             .addNode("fetch_booking", node_async(fetchBookingNode))
@@ -74,11 +89,23 @@ public class LangGraphAgentConfig {
             .addEdge(StateGraph.START, "fetch_booking")
             .addEdge("fetch_booking", "search_flights")
 
-            // Conditional Edge enforcing policy at the JVM level
+            // Resilient Conditional Edge: Retry Loop -> Circuit Breaker -> Policy Gate
             .addConditionalEdges(
                 "search_flights",
-                edge_async(state -> state.selectedPrice() <= 500.00 ? "rebook_flight" : "policy_fallback"),
+                edge_async(state -> {
+                    // Check if search encountered an error
+                    if (!state.lastError().isBlank()) {
+                        if (state.retryCount() < 2) {
+                            return "search_flights"; // Retry loop
+                        }
+                        return "policy_fallback"; // Circuit breaker trip
+                    }
+
+                    // Happy path: Enforce price policy
+                    return state.selectedPrice() <= 500.00 ? "rebook_flight" : "policy_fallback";
+                }),
                 Map.of(
+                    "search_flights", "search_flights",
                     "rebook_flight", "rebook_flight",
                     "policy_fallback", "policy_fallback"
                 )
